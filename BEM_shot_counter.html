@@ -10,31 +10,228 @@
     background: #f5f5f5;
     padding: 10px 20px;
   }
+  h2 { margin-top: 5px; margin-bottom: 10px; }
+  #count { font-size: 60px; font-weight: 700; margin: 20px 0; color: #222; }
+  .controls { margin-top: 15px; }
+  button { font-size: 22px; padding: 14px 28px; margin: 8px; border: none; border-radius: 12px; background: #007aff; color: white; }
+  button.stop { background: #ff3b30; }
+  button.connect { background: #34c759; }
+  button.disconnect { background: #ff9500; }
+  input { font-size: 22px; padding: 10px; width: 160px; margin-top: 8px; border-radius: 10px; border: 1px solid #ccc; }
+  #screenWarning { margin-top: 8px; font-size: 16px; color: #cc6600; font-weight: 500; }
+  #btStatus { margin-top: 10px; font-size: 16px; font-weight: 500; color: #888; }
+  #btStatus.connected { color: #34c759; }
+  #btStatus.error { color: #ff3b30; }
+  #psiDisplay { font-size: 18px; color: #555; margin-top: 4px; }
+  #manualSection { margin-top: 12px; padding-top: 12px; border-top: 1px solid #ddd; }
+  #manualLabel { font-size: 15px; color: #888; margin-bottom: 4px; }
+  #btNotSupported { display: none; margin-top: 10px; font-size: 15px; color: #ff3b30; }
+  #wakelockVideo { position: fixed; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+</style>
+</head>
+<body>
 
-  h2 {
-    margin-top: 5px;
-    margin-bottom: 10px;
+<h2>Shot Counter</h2>
+<div id="count">20</div>
+<div id="psiDisplay">PSI: --</div>
+
+<div class="controls">
+  <button id="connectButton" class="connect">Connect to Scale</button>
+</div>
+<div id="btStatus">Not connected</div>
+<div id="btNotSupported">Bluetooth not supported on this browser. Use manual entry below.</div>
+
+<div id="manualSection">
+  <div id="manualLabel">Manual pressure entry</div>
+  <label style="font-size:18px;">Pressure (PSI)</label><br>
+  <input id="tempoInput" type="number" value="200" step="1"><br>
+</div>
+
+<div class="controls">
+  <button id="startButton">Start</button>
+  <button id="stopButton" class="stop">Stop</button>
+</div>
+
+<div id="screenWarning">Screen must remain awake during use</div>
+<audio id="alarm" src=""></audio>
+<video id="wakelockVideo" playsinline loop muted>
+  <source src="data:video/mp4;base64,AAAAHGZ0eXBtcDQyAAAAAG1wNDFtcDQyaXNvbWF2YzEAAAAIZnJlZQAAAChtZGF0AAAAAA==" type="video/mp4">
+</video>
+
+<script>
+let current = 20;
+let running = false;
+let wakeLockEnabled = false;
+let btDevice = null;
+let btConnected = false;
+let currentPSI = null;
+
+const wakelockVideo = document.getElementById("wakelockVideo");
+
+function enableWakeLock() {
+  if (wakeLockEnabled) return;
+  wakeLockEnabled = true;
+  wakelockVideo.play().catch(() => { setTimeout(() => wakelockVideo.play().catch(() => {}), 100); });
+}
+
+function disableWakeLock() {
+  wakeLockEnabled = false;
+  wakelockVideo.pause();
+}
+
+function computeDelay(psi) {
+  return 484.07 * Math.pow(psi, -1.034) * 1000;
+}
+
+function getActivePSI() {
+  if (btConnected && currentPSI !== null) return currentPSI;
+  return parseFloat(document.getElementById("tempoInput").value);
+}
+
+function speakNumber(n) {
+  if (!("speechSynthesis" in window)) return;
+  const msg = new SpeechSynthesisUtterance(String(n));
+  msg.rate = 1.0;
+  window.speechSynthesis.speak(msg);
+}
+
+function tick() {
+  if (!running) return;
+  const psi = getActivePSI();
+  const delay = computeDelay(psi);
+  setTimeout(() => {
+    document.getElementById("count").textContent = current;
+    speakNumber(current);
+    current--;
+    if (current < 0) {
+      const alarm = document.getElementById("alarm");
+      if (alarm && alarm.src) { try { alarm.play(); } catch (e) {} }
+      current = 20;
+    }
+    tick();
+  }, delay);
+}
+
+function startCountdown() {
+  if (running) return;
+  running = true;
+  current = 20;
+  enableWakeLock();
+  tick();
+}
+
+function stopCountdown() {
+  running = false;
+  disableWakeLock();
+  if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+}
+
+const btStatusEl     = document.getElementById("btStatus");
+const psiDisplayEl   = document.getElementById("psiDisplay");
+const connectBtn     = document.getElementById("connectButton");
+const btNotSupported = document.getElementById("btNotSupported");
+
+if (!navigator.bluetooth) {
+  btNotSupported.style.display = "block";
+  connectBtn.style.display = "none";
+}
+
+function setBTStatus(msg, cssClass) {
+  btStatusEl.className = cssClass || "";
+  btStatusEl.textContent = msg;
+}
+
+async function connectToScale() {
+  try {
+    setBTStatus("Searching for BEM Scale...", "");
+
+    btDevice = await navigator.bluetooth.requestDevice({
+      filters: [{ name: "BEM Scale" }],
+      optionalServices: [
+        "0000ffe0-0000-1000-8000-00805f9b34fb",
+        "ffe0"
+      ]
+    });
+
+    setBTStatus("Connecting...", "");
+    btDevice.addEventListener("gattserverdisconnected", onDisconnected);
+
+    const server = await btDevice.gatt.connect();
+    setBTStatus("Getting service...", "");
+
+    let service;
+    try {
+      service = await server.getPrimaryService("0000ffe0-0000-1000-8000-00805f9b34fb");
+    } catch {
+      service = await server.getPrimaryService("ffe0");
+    }
+
+    setBTStatus("Getting characteristic...", "");
+    let char;
+    try {
+      char = await service.getCharacteristic("0000ffe1-0000-1000-8000-00805f9b34fb");
+    } catch {
+      char = await service.getCharacteristic("ffe1");
+    }
+
+    await char.startNotifications();
+    char.addEventListener("characteristicvaluechanged", handleBTData);
+
+    btConnected = true;
+    connectBtn.textContent = "Disconnect";
+    connectBtn.className = "disconnect";
+    connectBtn.onclick = disconnectFromScale;
+    setBTStatus("Connected to BEM Scale", "connected");
+
+  } catch (err) {
+    console.error("BT connection error:", err);
+    setBTStatus("Connection failed: " + err.message, "error");
   }
+}
 
-  #count {
-    font-size: 60px;
-    font-weight: 700;
-    margin: 20px 0;
-    color: #222;
+function handleBTData(event) {
+  const raw = new TextDecoder().decode(event.target.value);
+  const match = raw.match(/PSI:([\d.]+)/);
+  if (match) {
+    currentPSI = parseFloat(match[1]);
+    psiDisplayEl.textContent = "PSI: " + currentPSI.toFixed(1);
+    document.getElementById("tempoInput").value = currentPSI.toFixed(0);
   }
+}
 
-  .controls {
-    margin-top: 15px;
+function disconnectFromScale() {
+  if (btDevice && btDevice.gatt.connected) btDevice.gatt.disconnect();
+  onDisconnected();
+}
+
+function onDisconnected() {
+  btConnected = false;
+  currentPSI = null;
+  connectBtn.textContent = "Connect to Scale";
+  connectBtn.className = "connect";
+  connectBtn.onclick = connectToScale;
+  setBTStatus("Disconnected", "error");
+  psiDisplayEl.textContent = "PSI: --";
+}
+
+connectBtn.onclick = connectToScale;
+
+document.getElementById("startButton").addEventListener("click", function () {
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+    const msg = new SpeechSynthesisUtterance("Starting");
+    msg.rate = 1.0;
+    window.speechSynthesis.speak(msg);
   }
+  startCountdown();
+});
 
-  button {
-    font-size: 22px;
-    padding: 14px 28px;
-    margin: 8px;
-    border: none;
-    border-radius: 12px;
-    background: #007aff;
-    color: white;
+document.getElementById("stopButton").addEventListener("click", function () {
+  stopCountdown();
+});
+</script>
+</body>
+</html>    color: white;
   }
 
   button.stop {
